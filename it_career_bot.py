@@ -7,6 +7,7 @@
   • «Начать» / «Старт» — тест из 10 вопросов, ИИ подбирает IT-профессию.
   • Во время теста кнопки «Назад» (к прошлому вопросу) и «Отмена».
   • «Профессии» — каталог: описание каждой профессии по нажатию.
+  • Под результатом и в каталоге — ссылки на ресурсы и вузы России.
   • «Ресурсы» — полезные сайты и курсы для старта.
   • «Помощь» — что умеет бот.
   • После результата — проценты совпадения с профессиями.
@@ -67,7 +68,7 @@ import texts
 
 # ======================= НАСТРОЙКИ =======================
 
-VK_TOKEN = os.getenv("VK_TOKEN", "ВСТАВЬ_ТОКЕН_СООБЩЕСТВА")
+VK_TOKEN = os.getenv("VK_TOKEN", "")
 
 # Вариант А (основной): GigaChat. Пусто = не используем.
 GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY", "")
@@ -144,7 +145,7 @@ def stats_text():
         f"Тестов начато: {stats.get('started', 0)}",
         f"Тестов завершено: {stats.get('completed', 0)}",
         "",
-        "Результаты (по баллам теста):",
+        "Какие профессии получили школьники:",
     ]
     by_prof = stats.get("by_profession", {})
     for key, title in texts.PROFESSION_TITLES.items():
@@ -191,13 +192,17 @@ def answers_keyboard(options, show_back):
 
 # ======================= ОТПРАВКА СООБЩЕНИЙ =======================
 
-def send(vk, user_id, text, keyboard=None):
-    """Отправляет сообщение пользователю."""
+def send(vk, user_id, text, keyboard=None, no_preview=False):
+    """Отправляет сообщение пользователю.
+    no_preview=True — ВК не будет показывать большие карточки-превью
+    для ссылок в тексте (удобно, когда ссылок много)."""
     params = {
         "user_id": user_id,
         "message": text,
         "random_id": random.getrandbits(31),  # ВК требует случайное число
     }
+    if no_preview:
+        params["dont_parse_links"] = 1
     if keyboard:
         params["keyboard"] = keyboard
     vk.messages.send(**params)
@@ -242,6 +247,42 @@ def scores_text(scores):
     return "\n".join(lines)
 
 
+# ======================= РЕСУРСЫ И ВУЗЫ =======================
+
+# По каким словам в ответе ИИ понимаем, какую профессию он назвал
+PROFESSION_KEYWORDS = {
+    "web": ["веб-разработчик", "веб разработчик", "web-разработчик"],
+    "tester": ["тестировщик"],
+    "designer": ["ui/ux", "ux/ui", "дизайнер"],
+    "mobile": ["мобильн"],
+    "game": ["разработчик игр", "геймдев", "гейм-разработчик"],
+}
+
+
+def detect_profession(ai_text, default):
+    """Определяет, какую профессию назвал ИИ в своём ответе.
+    Берём то ключевое слово, которое встречается в тексте раньше всех
+    (ИИ просим называть профессию в начале). Если ничего не нашли —
+    возвращаем default (профессию с лучшим счётом по баллам)."""
+    lowered = ai_text.lower()
+    best_key, best_pos = default, None
+    for key, words in PROFESSION_KEYWORDS.items():
+        for word in words:
+            pos = lowered.find(word)
+            if pos != -1 and (best_pos is None or pos < best_pos):
+                best_key, best_pos = key, pos
+    return best_key
+
+
+def extras_text(key):
+    """Блок под результатом: ссылки на ресурсы и вузы России (из texts.py)."""
+    return (
+        f"{texts.RESOURCES_TITLE}\n{texts.PROFESSION_LINKS[key]}\n\n"
+        f"{texts.UNIVERSITIES_TITLE}\n{texts.PROFESSION_UNIVERSITIES[key]}\n\n"
+        f"{texts.UNIVERSITIES_NOTE}"
+    )
+
+
 # ======================= РАБОТА С ИИ =======================
 
 def build_prompt(answers, scores):
@@ -265,7 +306,9 @@ def build_prompt(answers, scores):
         f"Предварительный подсчёт баллов показал: {ranking_text}. "
         "Учти его, но опирайся и на ответы целиком.\n"
         f"Выбери ОДНУ наиболее подходящую профессию из списка: {professions}. "
-        "Ответь дружелюбно и простым языком, по пунктам:\n"
+        "Ответь дружелюбно и простым языком, по пунктам. "
+        "Название профессии пиши в самом начале ответа, точно как в списке. "
+        "Не придумывай ссылки и названия вузов — бот добавит их сам.\n"
         "1. Твоя профессия — название.\n"
         "2. В чём суть профессии (2-3 предложения).\n"
         "3. Ключевые навыки (3-5 штук).\n"
@@ -355,14 +398,22 @@ def finish_test(vk, user_id):
     best = max(scores, key=scores.get)  # профессия с наибольшим числом баллов
 
     # Сначала пробуем ИИ, если не вышло — берём готовое описание из texts.py
-    recommendation = ask_ai(build_prompt(answers, scores)) or texts.PROFESSIONS[best]
+    ai_text = ask_ai(build_prompt(answers, scores))
+    if ai_text:
+        recommendation = ai_text
+        shown = detect_profession(ai_text, default=best)  # что назвал ИИ
+    else:
+        recommendation = texts.PROFESSIONS[best]
+        shown = best
 
     send(vk, user_id, texts.RESULT_INTRO)
     send(vk, user_id, recommendation)
+    # Сразу под результатом — ссылки на ресурсы и вузы именно этой профессии
+    send(vk, user_id, extras_text(shown), no_preview=True)
     send(vk, user_id, scores_text(scores))
     send(vk, user_id, texts.RESTART, menu_keyboard())
 
-    record_stat("completed", best)
+    record_stat("completed", shown)
     del user_states[user_id]  # очищаем состояние
 
 
@@ -434,7 +485,8 @@ def handle_message(vk, user_id, text):
 
     elif text in TITLE_TO_KEY:  # нажата кнопка с названием профессии
         key = TITLE_TO_KEY[text]
-        send(vk, user_id, texts.PROFESSIONS[key], professions_keyboard())
+        send(vk, user_id, texts.PROFESSIONS[key])
+        send(vk, user_id, extras_text(key), professions_keyboard(), no_preview=True)
 
     elif lowered == "ресурсы":
         send(vk, user_id, texts.RESOURCES, menu_keyboard())
